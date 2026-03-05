@@ -5,17 +5,20 @@ on:
     branches:
       - main
 
+# Minimal default permissions
+permissions:
+  contents: read
+
 env:
   AWS_REGION: ap-south-1
   EKS_CLUSTER_NAME: devops-eks-cluster
   IMAGE_NAME: nodejs-eks-demo
+  IMAGE_TAG: ${{ github.run_number }}
 
 jobs:
-
-# ------------------------------------------------
-# INFRASTRUCTURE USING TERRAFORM
-# ------------------------------------------------
-
+  # ------------------------------------------------
+  # INFRASTRUCTURE USING TERRAFORM
+  # ------------------------------------------------
   terraform:
     name: Terraform Infrastructure
     runs-on: ubuntu-latest
@@ -29,16 +32,18 @@ jobs:
       jfrog_ip: ${{ steps.tf_outputs.outputs.jfrog_ip }}
 
     steps:
-
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY || secrets.AWS_SECRET_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS auth
+        run: aws sts get-caller-identity
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -58,36 +63,49 @@ jobs:
       - name: Get Terraform Outputs
         id: tf_outputs
         run: |
-          echo "sonar_ip=$(terraform output -raw sonarqube_public_ip)" >> $GITHUB_OUTPUT
-          echo "jfrog_ip=$(terraform output -raw jfrog_public_ip)" >> $GITHUB_OUTPUT
+          echo "sonar_ip=$(terraform output -raw sonarqube_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "jfrog_ip=$(terraform output -raw jfrog_public_ip)" >> "$GITHUB_OUTPUT"
 
-
-# ------------------------------------------------
-# BUILD + SONARQUBE ANALYSIS
-# ------------------------------------------------
-
+  # ------------------------------------------------
+  # BUILD + SONARQUBE ANALYSIS
+  # ------------------------------------------------
   build_and_scan:
     name: Build and Sonar Scan
     runs-on: ubuntu-latest
     needs: terraform
 
     steps:
-
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: 18
+          cache: npm
+          cache-dependency-path: app/package-lock.json
 
       - name: Install Dependencies
-        run: |
-          cd app
-          npm install
+        working-directory: app
+        run: npm ci
 
-      - name: Wait for SonarQube
-        run: sleep 120
+      - name: Wait for SonarQube to be reachable
+        env:
+          SONAR_HOST_URL: http://${{ needs.terraform.outputs.sonar_ip }}:9000
+        run: |
+          echo "Waiting for SonarQube at $SONAR_HOST_URL ..."
+          for i in {1..60}; do
+            if curl -fsS "$SONAR_HOST_URL/api/system/status" >/dev/null 2>&1; then
+              echo "SonarQube is up."
+              exit 0
+            fi
+            echo "Still waiting... ($i/60)"
+            sleep 10
+          done
+          echo "SonarQube did not become ready in time."
+          exit 1
 
       - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@v2
@@ -102,76 +120,90 @@ jobs:
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: http://${{ needs.terraform.outputs.sonar_ip }}:9000
 
-
-# ------------------------------------------------
-# DOCKER BUILD AND PUSH TO JFROG
-# ------------------------------------------------
-
+  # ------------------------------------------------
+  # DOCKER BUILD AND PUSH TO JFROG
+  # ------------------------------------------------
   docker:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: build_and_scan
+    needs: [terraform, build_and_scan]
 
     steps:
-
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Login to JFrog Docker Registry
+        env:
+          JFROG_HOST: ${{ needs.terraform.outputs.jfrog_ip }}
+          JFROG_USER: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASS: ${{ secrets.JFROG_PASSWORD }}
         run: |
-          docker login ${{ needs.terraform.outputs.jfrog_ip }}:8082 \
-          -u ${{ secrets.JFROG_USERNAME }} \
-          -p ${{ secrets.JFROG_PASSWORD }}
+          echo "$JFROG_PASS" | docker login "$JFROG_HOST:8082" -u "$JFROG_USER" --password-stdin
 
       - name: Build Docker Image
+        env:
+          JFROG_HOST: ${{ needs.terraform.outputs.jfrog_ip }}
         run: |
-          docker build -t ${{ needs.terraform.outputs.jfrog_ip }}:8082/docker-local/nodejs-app:${{ github.run_number }} ./app
+          docker build \
+            -t "$JFROG_HOST:8082/docker-local/nodejs-app:${{ env.IMAGE_TAG }}" \
+            ./app
 
       - name: Push Docker Image
+        env:
+          JFROG_HOST: ${{ needs.terraform.outputs.jfrog_ip }}
         run: |
-          docker push ${{ needs.terraform.outputs.jfrog_ip }}:8082/docker-local/nodejs-app:${{ github.run_number }}
+          docker push "$JFROG_HOST:8082/docker-local/nodejs-app:${{ env.IMAGE_TAG }}"
 
-
-# ------------------------------------------------
-# DEPLOY TO EKS
-# ------------------------------------------------
-
+  # ------------------------------------------------
+  # DEPLOY TO EKS
+  # ------------------------------------------------
   deploy:
     name: Deploy to EKS
     runs-on: ubuntu-latest
-    needs: docker
+    needs: [terraform, docker]
 
     steps:
-
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY || secrets.AWS_SECRET_KEY }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS auth
+        run: aws sts get-caller-identity
 
       - name: Update kubeconfig
         run: |
-          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          aws eks update-kubeconfig --name "${{ env.EKS_CLUSTER_NAME }}" --region "${{ env.AWS_REGION }}"
 
       - name: Deploy Kubernetes Manifests
         run: |
           kubectl apply -f k8s/deployment.yaml
           kubectl apply -f k8s/service.yaml
 
+      # OPTIONAL but recommended: ensure the deployment uses the new image tag
+      # Update container name if different from "nodejs-container"
+      - name: Update Image to latest tag
+        env:
+          JFROG_HOST: ${{ needs.terraform.outputs.jfrog_ip }}
+        run: |
+          kubectl set image deployment/nodejs-deployment \
+            nodejs-container="$JFROG_HOST:8082/docker-local/nodejs-app:${{ env.IMAGE_TAG }}" \
+            --record=true
+
       - name: Verify Deployment
         run: |
           kubectl rollout status deployment/nodejs-deployment
 
-
-# ------------------------------------------------
-# EMAIL NOTIFICATION
-# ------------------------------------------------
-
+  # ------------------------------------------------
+  # EMAIL NOTIFICATION
+  # ------------------------------------------------
   notify:
     name: Send Email Notification
     runs-on: ubuntu-latest
@@ -179,7 +211,6 @@ jobs:
     if: always()
 
     steps:
-
       - name: Send Email
         uses: dawidd6/action-send-mail@v3
         with:
@@ -187,7 +218,7 @@ jobs:
           server_port: 465
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: GitHub Actions CI/CD Pipeline Status
+          subject: GitHub Actions CI/CD Pipeline Status - ${{ github.repository }}
           to: ${{ secrets.EMAIL_TO }}
           from: GitHub Actions
           body: |
@@ -195,10 +226,11 @@ jobs:
 
             Repository: ${{ github.repository }}
             Branch: ${{ github.ref }}
+            Run: ${{ github.run_id }}
 
-            Terraform: Completed
-            SonarQube Scan: Completed
-            Docker Build: Completed
-            Deployment to EKS: Completed
+            Terraform: ${{ needs.terraform.result }}
+            SonarQube Scan: ${{ needs.build_and_scan.result }}
+            Docker Build: ${{ needs.docker.result }}
+            Deployment to EKS: ${{ needs.deploy.result }}
 
-            Check GitHub Actions for full logs.
+            Check GitHub Actions logs for full details.
