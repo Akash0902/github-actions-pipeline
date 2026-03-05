@@ -1,0 +1,204 @@
+name: DevOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: devops-eks-cluster
+  IMAGE_NAME: nodejs-eks-demo
+
+jobs:
+
+# ------------------------------------------------
+# INFRASTRUCTURE USING TERRAFORM
+# ------------------------------------------------
+
+  terraform:
+    name: Terraform Infrastructure
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    outputs:
+      sonar_ip: ${{ steps.tf_outputs.outputs.sonar_ip }}
+      jfrog_ip: ${{ steps.tf_outputs.outputs.jfrog_ip }}
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      - name: Get Terraform Outputs
+        id: tf_outputs
+        run: |
+          echo "sonar_ip=$(terraform output -raw sonarqube_public_ip)" >> $GITHUB_OUTPUT
+          echo "jfrog_ip=$(terraform output -raw jfrog_public_ip)" >> $GITHUB_OUTPUT
+
+
+# ------------------------------------------------
+# BUILD + SONARQUBE ANALYSIS
+# ------------------------------------------------
+
+  build_and_scan:
+    name: Build and Sonar Scan
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Install Dependencies
+        run: |
+          cd app
+          npm install
+
+      - name: Wait for SonarQube
+        run: sleep 120
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        with:
+          projectBaseDir: app
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: http://${{ needs.terraform.outputs.sonar_ip }}:9000
+
+      - name: SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+
+# ------------------------------------------------
+# DOCKER BUILD AND PUSH TO JFROG
+# ------------------------------------------------
+
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build_and_scan
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Login to JFrog Docker Registry
+        run: |
+          docker login ${{ needs.terraform.outputs.jfrog_ip }}:8082 \
+          -u ${{ secrets.JFROG_USERNAME }} \
+          -p ${{ secrets.JFROG_PASSWORD }}
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ needs.terraform.outputs.jfrog_ip }}:8082/docker-local/nodejs-app:${{ github.run_number }} ./app
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ needs.terraform.outputs.jfrog_ip }}:8082/docker-local/nodejs-app:${{ github.run_number }}
+
+
+# ------------------------------------------------
+# DEPLOY TO EKS
+# ------------------------------------------------
+
+  deploy:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: docker
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Deploy Kubernetes Manifests
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/nodejs-deployment
+
+
+# ------------------------------------------------
+# EMAIL NOTIFICATION
+# ------------------------------------------------
+
+  notify:
+    name: Send Email Notification
+    runs-on: ubuntu-latest
+    needs: [terraform, build_and_scan, docker, deploy]
+    if: always()
+
+    steps:
+
+      - name: Send Email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: GitHub Actions CI/CD Pipeline Status
+          to: ${{ secrets.EMAIL_TO }}
+          from: GitHub Actions
+          body: |
+            CI/CD Pipeline Finished
+
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref }}
+
+            Terraform: Completed
+            SonarQube Scan: Completed
+            Docker Build: Completed
+            Deployment to EKS: Completed
+
+            Check GitHub Actions for full logs.
