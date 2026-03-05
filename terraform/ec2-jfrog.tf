@@ -10,3 +10,4 @@ resource "aws_instance" "jfrog_server"{
   tags = {
     Name = "jfrog-artifactory"
 }
+}
