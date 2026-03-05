@@ -1,1 +1,21 @@
-
+{
+  "name": "nodejs-eks-demo",
+  "version": "1.0.0",
+  "description": "Node.js CI/CD Pipeline with GitHub Actions, SonarQube, JFrog and EKS",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [
+    "nodejs",
+    "devops",
+    "eks",
+    "cicd"
+  ],
+  "author": "akash",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
